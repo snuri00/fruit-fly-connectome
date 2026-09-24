@@ -1,0 +1,3 @@
+[submodule "Drosophila_brain_model"]
+	path = Drosophila_brain_model
+	url = https://github.com/philshiu/Drosophila_brain_model.git
