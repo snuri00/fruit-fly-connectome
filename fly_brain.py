@@ -14,6 +14,9 @@ A neuron whose v crosses v_th spikes, is reset (v = v_rst, g = 0) and is
 refractory for t_rfc. After a delay t_dly each spike adds
 w_syn x (signed synapse count) to the g of every postsynaptic neuron.
 As in Brian2, input that reaches a neuron while it is refractory is lost.
+
+`bias` (mV, default 0 as in the paper) is a constant depolarisation per
+neuron: dv/dt = (v_0 + bias - v + g) / t_mbr. It models tonic activity.
 The sign comes from the predicted neurotransmitter (Eckstein et al. 2024):
 acetylcholine excites, GABA and glutamate inhibit.
 
@@ -53,14 +56,14 @@ PARAMS = {
 
 
 @njit(cache=True)
-def _integrate(t, v, g, ref_until, v_0, v_th, e_m, e_s, c_vg, fired):
+def _integrate(t, v, g, ref_until, bias, v_0, v_th, e_m, e_s, c_vg, fired):
     """Exact linear update of v and g for non-refractory neurons, then threshold.
     Writes spiking indices into `fired` and returns how many there are."""
     k = 0
     for i in range(v.shape[0]):
         if ref_until[i] >= t:
             continue
-        vi = v_0 + (v[i] - v_0) * e_m + g[i] * c_vg
+        vi = v_0 + bias[i] + (v[i] - v_0 - bias[i]) * e_m + g[i] * c_vg
         g[i] *= e_s
         v[i] = vi
         if vi > v_th:
@@ -109,6 +112,7 @@ class FlyBrain:
             shape=(n, n))
         self.n_connections = self.W.nnz
         self.n_synapses = int(np.abs(con["Excitatory x Connectivity"]).sum())
+        self.bias = np.zeros(n, dtype=np.float64)
         self._w_intact = None
         self.silenced = np.empty(0, dtype=np.int64)
         del con
@@ -187,13 +191,15 @@ class FlyBrain:
         self.set_input([])
 
     def set_input(self, drive):
-        """Poisson drive: a list of (neuron indices, rate in Hz) pairs.
-        It replaces the previous drive. Driven neurons have no refractory period."""
+        """Poisson drive: a list of (neuron indices, rate in Hz) pairs; the rate
+        is a number or an array with one rate per neuron. It replaces the
+        previous drive. Driven neurons have no refractory period."""
         idx, prob = [], []
         for neu, hz in drive:
             neu = np.asarray(neu, dtype=np.int64)
             idx.append(neu)
-            prob.append(np.full(len(neu), hz * self.dt * 1e-3, dtype=np.float32))
+            prob.append(np.broadcast_to(np.asarray(hz, dtype=np.float32) * (self.dt * 1e-3),
+                                        neu.shape).astype(np.float32))
         self._poi_idx = np.concatenate(idx) if idx else np.empty(0, np.int64)
         self._poi_p = np.concatenate(prob) if prob else np.empty(0, np.float32)
         self._driven = np.zeros(self.n, dtype=np.bool_)
@@ -204,7 +210,7 @@ class FlyBrain:
         integrate -> threshold -> synapses (+ Poisson input) -> reset."""
         p = self.p
         t = self.t
-        k = _integrate(t, self.v, self.g, self.ref_until, p["v_0"], p["v_th"],
+        k = _integrate(t, self.v, self.g, self.ref_until, self.bias, p["v_0"], p["v_th"],
                        self._e_m, self._e_s, self._c_vg, self._fired_buf)
         fired = self._fired_buf[:k].copy()
 

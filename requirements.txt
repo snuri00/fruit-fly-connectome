@@ -4,3 +4,6 @@ pyarrow>=14
 scipy>=1.10
 numba>=0.59
 pygame>=2.1
+vizdoom>=1.2
+flyvis>=1.2
+opencv-python-headless>=4.8
