@@ -50,6 +50,24 @@ GAIN = 400.0
 RATE_MAX = 250.0
 ADAPT_TAU = 0.5
 ADAPT_TAU_MOTION = 2.0
+WIDE_FIELD = ("Am", "CT1", "Lawf")
+STAGES = ["photoreceptors", "lamina", "medulla", "motion (T4/T5)", "lobula"]
+
+
+def stage_of(cell_type):
+    """Processing stage of a flyvis cell type, or None for wide-field cells."""
+    t = str(cell_type)
+    if t.startswith(WIDE_FIELD):
+        return None
+    if t.startswith("R"):
+        return "photoreceptors"
+    if t.startswith("L") and t[1:].isdigit():
+        return "lamina"
+    if t.startswith(("T4", "T5")):
+        return "motion (T4/T5)"
+    if t.startswith(("T2", "T3", "TmY")):
+        return "lobula"
+    return "medulla"
 
 
 def fw_pixel(p, q):
@@ -83,6 +101,8 @@ class FlyEyes:
         self._type_hex = {}
         self._scale = {}
         self._map_flywire()
+        self._map_visual()
+        self.node_stage = np.array([stage_of(t) for t in self.node_type], dtype=object)
 
     def _hex_labels(self, n):
         """For an n x n patch, the ommatidium each pixel belongs to."""
@@ -116,6 +136,67 @@ class FlyEyes:
         self.fw_eye = np.array(eye)
         self.fw_node = np.array(node)
         self.fw_type = self.node_type[self.fw_node]
+
+    def _map_visual(self):
+        """flyvis node for every columnar FlyWire visual neuron, for display.
+        Types in the Codex column table use its columns. Others, most of all
+        R1-6 (which the table leaves out, as OpticLobe.jl notes), get the
+        synapse-weighted mean position of their partners that have a column."""
+        b = self.brain
+        col = pd.read_csv(COLUMNS)
+        col = col[col.root_id.isin(b.idx)]
+        pix = np.full((b.n, 2), np.nan)
+        known = np.array([b.idx[r] for r in col.root_id])
+        pix[known] = fw_pixel(col.p.to_numpy(), col.q.to_numpy())
+        hemi = np.full(b.n, "", dtype=object)
+        hemi[known] = col.hemisphere.to_numpy()
+        ftype = np.full(b.n, "", dtype=object)
+        ftype[known] = col.type.to_numpy()
+
+        ct = b.annot["cell_type"].fillna("").to_numpy().astype(str)
+        side = b.annot["side"].fillna("").to_numpy()
+        wanted = set(t for t in self.types if stage_of(t)) | {"R1-6"}
+        missing = np.flatnonzero(np.isin(ct, list(wanted)) & np.isnan(pix[:, 0]))
+        if len(missing):
+            A = abs(b.W[missing]) + abs(b.W[:, missing]).T
+            k = np.flatnonzero(~np.isnan(pix[:, 0]))
+            Ak = A.tocsc()[:, k]
+            wsum = np.asarray(Ak.sum(axis=1)).ravel()
+            est = (Ak @ pix[k]) / np.maximum(wsum, 1e-9)[:, None]
+            ok = wsum > 0
+            pix[missing[ok]] = est[ok]
+            hemi[missing[ok]] = side[missing[ok]]
+            ftype[missing[ok]] = ct[missing[ok]]
+        self.inferred = int(len(missing) and ok.sum())
+
+        use = np.flatnonzero(~np.isnan(pix[:, 0]) & np.isin(hemi, EYES))
+        fv = -np.sqrt(3) * pix[use]
+        d = (fv[:, None, 0] - self.hx) ** 2 + (fv[:, None, 1] - self.hy) ** 2
+        hexal, inside = d.argmin(1), d.min(1) < 1.5
+        key = {(t, int(u), int(v)): i for i, (t, (u, v)) in enumerate(zip(self.node_type, self.node_uv))}
+        vis, eye, node = [], [], []
+        for i, h, ok_ in zip(use, hexal, inside):
+            t = "R1" if ftype[i] == "R1-6" else ftype[i]
+            k_ = key.get((t, int(self.u[h]), int(self.v[h])))
+            if ok_ and k_ is not None:
+                vis.append(i)
+                eye.append(EYES.index(hemi[i]))
+                node.append(k_)
+        self.vis_idx = np.array(vis, dtype=np.int64)
+        self.vis_eye = np.array(eye)
+        self.vis_node = np.array(node)
+        self.vis_stage = np.array([stage_of(t) for t in self.node_type[self.vis_node]], dtype=object)
+
+    def visual_levels(self, gain=3.0):
+        """0..1 display level of every mapped FlyWire visual neuron: how far its
+        flyvis counterpart is from its adapted level (either sign)."""
+        dev = self.activity[self.vis_eye, self.vis_node] - self.adapted[self.vis_eye, self.vis_node]
+        return np.clip(np.abs(dev) * gain, 0.0, 1.0)
+
+    def stage_activity(self):
+        """Mean absolute deviation from the adapted level per stage (flyvis units)."""
+        dev = np.abs(self.activity - self.adapted)
+        return {st: float(dev[:, self.node_stage == st].mean()) for st in STAGES}
 
     def sample(self, gray):
         """gray: H x W float image in [0, 1]. Returns (2, 721) photoreceptor input."""
@@ -187,7 +268,7 @@ class FlyEyes:
 
     def type_map(self, eye, t):
         idx = self._hex_index(t)
-        a = self.activity[eye, idx] - self.baseline[eye, idx]
+        a = self.activity[eye, idx] - self.adapted[eye, idx]
         return np.where(idx >= 0, a, 0.0)
 
     def motion_map(self, eye):

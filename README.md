@@ -39,6 +39,7 @@ python3 fly_swat.py --headless 20   # measure escape rates, no window
 python3 fly_doom.py                 # the fly plays DOOM
 python3 fly_doom.py --headless 10   # fly vs random and lesioned players
 python3 fly_doom.py --learn 20      # 20 episodes with dopamine learning
+python3 conditioning.py --flies 16 --procs 6   # does the mushroom body learn? (~50 min)
 python3 fly_cam.py                  # your camera through the fly's eyes
 python3 fly_cam.py --demo loom      # the same with a synthetic looming disc
 ```
@@ -206,6 +207,80 @@ difference is not significant (paired t-test p = 0.20, n = 40). About
 1,700 of the 62,261 Kenyon cell → MBON synapses end up depressed. This is
 a trend, not yet a demonstration that the fly learns to play.
 
+### Does the mushroom body learn? A conditioning experiment (`conditioning.py`)
+
+The DOOM score is too noisy to answer this, so the question was put the
+way it is put to real flies: differential aversive conditioning
+(Tully & Quinn 1985), read out from the MBONs before and after training
+(Hige et al. 2015).
+
+- **Stimuli.** Two visual stimuli reach the mushroom body through different
+  visual projection neurons of the left hemisphere: A (aMe12, aMe20, LTe16)
+  and B (MTe30, MTe32, MTe40, LTe25). They activate about 30 and 50 Kenyon
+  cells, with 7 in common (Jaccard 0.08), so the code is sparse without any
+  change to the model.
+- **Training.** 6 cycles: CS+ for 1 s together with the punishment dopamine
+  neurons PPL1 (the model's electric shock), CS- alone, 8 s gaps. Half of the
+  flies have A as CS+, half B.
+- **Readout.** Mean membrane depolarisation of each MBON during a stimulus,
+  the counterpart of calcium or voltage imaging; mean of 3 presentations. The
+  MBONs that respond in the pre-test (> 0.3 mV) are fixed before training.
+  Memory score = change to CS- minus change to CS+, summed over them:
+  positive when the response to CS+ is specifically reduced.
+- **Nothing tuned.** Published neuron and synapse parameters; the learning
+  rule and constants of Fly DOOM (eta 0.02, eligibility 1.5 s, recovery 60 s).
+  One change was made after a 2-fly trial run and before the experiment:
+  tests average 3 presentations instead of 1, to reduce Poisson noise.
+- **Flies.** 16 per condition; a fly is the model with its own random seed.
+
+| Condition | Score 8 s after training | p (> 0, Wilcoxon) |
+|---|---|---|
+| **paired** (CS+ with PPL1) | **+1.12 mV (+12 %)** | **0.0007** |
+| unpaired (PPL1 8 s after CS+) | −0.11 mV | 0.63 |
+| CS only | −0.56 mV | 0.99 |
+| dopamine only | −0.20 mV | 0.59 |
+| no plasticity (paired, eta = 0) | −0.64 mV | 0.99 |
+
+Paired is higher than every control (Mann-Whitney, one-sided: unpaired
+p = 0.002, CS only p = 0.0002, dopamine only p = 0.0015, no plasticity
+p = 0.0001). With the roles swapped for another 6 cycles the memory reverses:
+the score of the original CS+ falls by 3.30 mV (p = 0.00002, n = 16). It
+decays with time: 90 s after training the paired flies are back near the
+controls.
+
+All controls sit at about −0.5 mV, even the one in which no synapse can
+change. That offset is a property of the measurement, most likely
+regression to the mean from choosing the responsive MBONs on the pre-test.
+The cleanest comparison is therefore paired against no plasticity: about
+1.8 mV, p = 0.0001.
+
+**What this shows.** Under the fly's own learning rule, the connectome's
+mushroom body forms a memory that is specific to the stimulus paired with
+punishment, depends on the pairing in time and on plasticity, reverses, and
+fades. **What it does not show.** The effect is modest (12 %), the memory
+is measured in MBONs and not in behaviour, and the plasticity rule itself is
+added to the published model; the experiment shows that the connectome
+supports this form of learning, not that the model learned without it.
+
+**Next version (in the script, not yet run to completion).** `conditioning.py`
+now chooses the responsive MBONs in a separate selection test, so that the
+baseline is not biased by that choice, and adds a behavioural read-out: an
+MBON's valence is taken as opposite to that of the dopamine in its compartment
+(Aso et al. 2014), its weight is its PPL1 share minus its PAM share of DAN→MBON
+synapses, and at each test the fly "walks into" the arm whose stimulus has the
+higher approach drive, giving a T-maze preference index. The tables above
+come from the previous version.
+
+**Towards odours (`calibrate_olfaction.py`, work in progress).** With one
+strength for every synapse the antennal lobe runs away: one glomerulus at
+30 Hz drives 81 % of all projection neurons and 68 % of the Kenyon cells,
+whatever the stimulus strength. A single gain for the excitatory synapses
+between antennal lobe neurons is calibrated against an independent target,
+5–10 % of Kenyon cells per odour (Turner et al. 2008; Honegger et al. 2011),
+on odours the learning experiments never use. A first scan put it at 0.3
+(4.4 % of Kenyon cells, and projection neurons that again follow stimulus
+strength); a finer scan and the odour conditioning are still to be run.
+
 ## Fly Eye Cam
 
 **Why a second model for the eyes.** In the spiking whole-brain model every
@@ -226,8 +301,25 @@ column comes from the Codex column assignment (Matsliah et al., Nature 2024).
 The two hexagonal lattices were aligned from the connectome: for every T4
 subtype the offset from its Mi4 to its Mi9 inputs points along its preferred
 direction in both models, and a 180° rotation makes all four agree (mean
-cosine 0.97–0.98 in either eye; the next best candidate 0.55). Tonic cell
-types adapt with a 0.5 s time constant so that a still scene fades out.
+cosine 0.97–0.98 in either eye; the next best candidate 0.55). Every flyvis
+cell drives the brain by its distance from an adapted level: tonic types
+(Tm, T2, T3) adapt with 0.5 s, T4/T5 with 2 s (motion adaptation), so that a
+still scene fades out within about two seconds.
+
+**The console.**
+
+- *Brain*: all 138,639 neurons. 40,138 of the optic lobe neurons show the
+  activity of their flyvis counterpart and are coloured by stage
+  (photoreceptors, lamina, medulla, T4/T5, lobula); columns missing from the
+  Codex table, most of all the R1-6 photoreceptors, are placed at the
+  synapse-weighted position of their partners. Landmarks and a 100 µm bar.
+- *Signal flow*: the last 6 s of eight stages, from the photoreceptors
+  through lamina, medulla, T4/T5 and lobula (flyvis) to the visual projection
+  neurons, central brain and descending neurons (FlyWire), so a movement can
+  be followed as it travels into the brain.
+- *Motion detectors* (colour = direction), *motion detector* compasses,
+  world rotation from HS/H2, looming and giant fibers with a 6 s recording.
+- F11 toggles full screen; the models load in the background (~16 s).
 
 **What comes out** (synthetic movies, 0.8 s each; Hz)
 
@@ -356,9 +448,11 @@ often. A slow swing is seen coming; a fast one leaves too little time.
 | `fly_swat.py` | Fly Swat game (pygame) and headless benchmark |
 | `doom_world.py` | ViZDoom environment, panoramic eye, brain → buttons |
 | `fly_learning.py` | dopamine-gated plasticity: mushroom body and steering-synapse rules |
+| `conditioning.py` | differential conditioning experiment with controls, reversal and memory decay |
+| `calibrate_olfaction.py` | antennal lobe gain calibrated against Kenyon cell sparseness (work in progress) |
 | `fly_doom.py` | Fly DOOM viewer (pygame), headless benchmark and learning experiment |
 | `fly_eye.py` | compound eyes: camera image → flyvis retina and optic lobe → FlyWire neurons |
-| `fly_cam.py` | Fly Eye Cam (pygame): camera, eye mosaics, motion map, brain readouts |
+| `fly_cam.py` | Fly Eye Cam (pygame): camera, eye mosaics, motion map, brain map, signal flow |
 | `experiments.py` | stimulus → response experiments from the command line |
 | `Drosophila_brain_model/` | Shiu et al. model (git submodule): connectivity data, Brian2 reference |
 

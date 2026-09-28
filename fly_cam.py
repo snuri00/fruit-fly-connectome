@@ -16,7 +16,8 @@ steering neurons.
     python3 fly_cam.py --video clip.mp4
     python3 fly_cam.py --demo loom     synthetic looming disc (no camera needed)
 
-Keys: SPACE pause   ESC quit
+Keys: SPACE pause   F11 / F full screen   ESC quit
+The window can also be resized; the picture scales and keeps its proportions.
 """
 import argparse
 import math
@@ -33,9 +34,11 @@ import numpy as np
 CANVAS = (1600, 960)
 CAM = (20, 72, 560, 420)
 DETECTOR = (20, 504, 560, 432)
-EYES_RECT = (600, 72, 580, 420)
-MOTION_RECT = (600, 504, 580, 432)
-SIDE_X = 1200
+EYES_RECT = (600, 72, 500, 420)
+MOTION_RECT = (600, 504, 500, 432)
+SIDE_X = 1120
+BRAIN_RECT = (SIDE_X, 72, 460, 330)
+FLOW_RECT = (SIDE_X, 414, 460, 522)
 
 BG = (11, 12, 15)
 PANEL = (20, 21, 26)
@@ -48,9 +51,24 @@ LOOM = (255, 110, 90)
 ROT = (110, 190, 255)
 GF = (255, 80, 80)
 STEER = (120, 220, 150)
+STAGE_COLORS = {
+    "photoreceptors": (255, 226, 110),
+    "lamina": (255, 150, 70),
+    "medulla": (120, 225, 130),
+    "motion (T4/T5)": (80, 160, 255),
+    "lobula": (180, 130, 255),
+}
+POP_COLORS = {"visual projection": (80, 215, 235), "central brain": (255, 184, 80),
+              "descending": (255, 96, 200)}
 TRACE_S = 6.0
 BRAIN_STEP_MS = 10.0
-FRAME_BUDGET = 0.045
+FRAME_BUDGET = 0.03
+
+
+def wheel(angle, k=1.0):
+    """Colour of a direction on the colour wheel (0 = right, pi/2 = up)."""
+    h = (angle / (2 * math.pi)) % 1.0
+    return tuple(int(12 + 243 * k * (0.5 + 0.5 * math.cos(2 * math.pi * (h - o)))) for o in (0.0, 1 / 3, 2 / 3))
 
 
 def mix(c1, c2, k):
@@ -125,15 +143,15 @@ class DemoSource:
 
 class App:
     def __init__(self, source):
+        """Opens the window at once and loads the models on a background thread,
+        so the window keeps answering the desktop while they load (~15 s)."""
         import pygame
-        from brain_view import BrainMap, Glow
-        from fly_brain import FlyBrain
-        from fly_circuits import Circuits
-        from fly_eye import FlyEyes
         self.pg = pygame
         pygame.init()
         pygame.display.set_caption("Fly Eye Cam")
-        self.screen = pygame.display.set_mode(CANVAS)
+        self.window = pygame.display.set_mode(CANVAS, pygame.RESIZABLE)
+        self.screen = pygame.Surface(CANVAS)
+        self.fullscreen = False
         self.clock = pygame.time.Clock()
         f = pygame.font.SysFont
         self.f_title = f("dejavusans", 20, bold=True)
@@ -141,16 +159,56 @@ class App:
         self.f_small = f("dejavusans", 11)
         self.f_mono = f("dejavusansmono", 13)
         self.f_big = f("dejavusans", 46, bold=True)
-        self.screen.fill(BG)
-        s = self.f_title.render("loading the fly's eyes and brain ...", True, MUTED)
-        self.screen.blit(s, s.get_rect(center=(CANVAS[0] // 2, CANVAS[1] // 2)))
-        pygame.display.flip()
-
         self.source = source
-        self.brain = FlyBrain(seed=int(time.time()))
-        self.brain.run(0.2)
-        self.eyes = FlyEyes(self.brain)
-        self.circ = Circuits(self.brain)
+        self.loading = "starting"
+        self.load_error = None
+        self.load_t0 = time.time()
+        self.running = True
+        loader = threading.Thread(target=self._load_models, daemon=True)
+        loader.start()
+        while loader.is_alive() and self.running:
+            self._pump_while_loading()
+        if not self.running:
+            source.close()
+            raise SystemExit(0)
+        if self.load_error:
+            raise self.load_error
+        self._setup_views()
+
+    def _pump_while_loading(self):
+        pg = self.pg
+        for ev in pg.event.get():
+            if ev.type == pg.QUIT or (ev.type == pg.KEYDOWN and ev.key == pg.K_ESCAPE):
+                self.running = False
+        self.screen.fill(BG)
+        s = self.f_title.render(f"loading {self.loading} ...", True, MUTED)
+        self.screen.blit(s, s.get_rect(center=(CANVAS[0] // 2, CANVAS[1] // 2)))
+        t = self.f_small.render(f"{time.time() - self.load_t0:.0f} s", True, FAINT)
+        self.screen.blit(t, t.get_rect(center=(CANVAS[0] // 2, CANVAS[1] // 2 + 30)))
+        self.present()
+        self.clock.tick(20)
+
+    def _load_models(self):
+        try:
+            from fly_brain import FlyBrain
+            from fly_circuits import Circuits
+            from fly_eye import FlyEyes
+            self.loading = "the FlyWire brain (138,639 neurons)"
+            self.brain = FlyBrain(seed=int(time.time()))
+            self.brain.run(0.2)
+            self.loading = "the compound eyes (flyvis) and their FlyWire columns"
+            self.eyes = FlyEyes(self.brain)
+            self.circ = Circuits(self.brain)
+        except BaseException as err:
+            self.load_error = err
+
+    def _setup_views(self):
+        """Runs on the main thread. flyvis sets torch's default device when it is
+        imported, and that setting is per thread, so it is repeated here."""
+        import flyvis
+        import torch
+        from brain_view import BrainMap, Glow
+        torch.set_default_device(flyvis.device)
         b = self.brain
         self.groups = {
             "LC4": {s: b.neurons(cell_type="LC4", side=s) for s in ("left", "right")},
@@ -161,8 +219,17 @@ class App:
             "DNa": {s: b.neurons(cell_type=["DNa01", "DNa02"], side=s) for s in ("left", "right")},
         }
         self.rate = {g: {"left": 0.0, "right": 0.0} for g in self.groups}
-        self.map = BrainMap(b, (360, 180), background=PANEL)
+        self.map = BrainMap(b, (440, 214), background=PANEL)
+        for st, col in STAGE_COLORS.items():
+            self.map.color[self.eyes.vis_idx[self.eyes.vis_stage == st]] = col
         self.glow = Glow(b.n, 200.0)
+        sc = b.annot["super_class"].fillna("").to_numpy()
+        self.pops = {"visual projection": np.flatnonzero(sc == "visual_projection"),
+                     "central brain": np.flatnonzero(sc == "central"),
+                     "descending": np.flatnonzero(sc == "descending")}
+        self.stage_n = {st: int((self.eyes.vis_stage == st).sum()) for st in STAGE_COLORS}
+        self.flow = deque()
+        self.regions = self._region_labels()
         self.hex_px = self._hex_layout()
         self.motion = np.zeros((2, 2, self.eyes.n_hex))
         self.trace = deque()
@@ -170,19 +237,68 @@ class App:
         self.speed = 0.0
         self.last_frame = None
 
+    def _region_labels(self):
+        """Map coordinates of a few landmarks, from the neurons that lie there."""
+        b, m = self.brain, self.map
+        a = b.annot
+        ct = a["cell_type"].fillna("").to_numpy()
+        cc = a["cell_class"].fillna("").to_numpy()
+        side = a["side"].fillna("").to_numpy()
+        near = "left" if m.left_on_screen_left else "right"
+        groups = [("lamina", (ct == "L1") & (side == near)),
+                  ("medulla", (ct == "Mi1") & (side == near)),
+                  ("lobula plate", (ct == "T4a") & (side == near)),
+                  ("lobula", (ct == "LC4") & (side == near)),
+                  ("mushroom body", (cc == "Kenyon_Cell") & (side != near)),
+                  ("antennal lobe", (cc == "ALLN") & (side != near)),
+                  ("central complex", cc == "CX"),
+                  ("SEZ", cc == "gustatory")]
+        out = []
+        for name, mask in groups:
+            idx = np.flatnonzero(mask & m.ok)
+            if len(idx):
+                out.append((name, (int(np.median(m.px[idx])), int(np.median(m.py[idx])))))
+        return out
+
     def _hex_layout(self):
         """Screen offsets of the ommatidia: flyvis pixel coordinates are a flat-top
         hexagonal grid of hexagon radius 1, with y pointing up."""
         size = 5.4
         return self.eyes.hx * size, -self.eyes.hy * size, size
 
+    def present(self):
+        """Scale the fixed-size canvas into the window, keeping its proportions."""
+        pg = self.pg
+        ww, wh = self.window.get_size()
+        k = min(ww / CANVAS[0], wh / CANVAS[1])
+        size = (int(CANVAS[0] * k), int(CANVAS[1] * k))
+        self.window.fill((0, 0, 0))
+        img = self.screen if size == CANVAS else pg.transform.smoothscale(self.screen, size)
+        self.window.blit(img, ((ww - size[0]) // 2, (wh - size[1]) // 2))
+        pg.display.flip()
+
+    def toggle_fullscreen(self):
+        pg = self.pg
+        self.fullscreen = not self.fullscreen
+        if self.fullscreen:
+            self.window = pg.display.set_mode((0, 0), pg.FULLSCREEN)
+        else:
+            self.window = pg.display.set_mode(CANVAS, pg.RESIZABLE)
+
     def run(self):
         pg = self.pg
         running = True
         while running:
             for ev in pg.event.get():
-                if ev.type == pg.QUIT or (ev.type == pg.KEYDOWN and ev.key == pg.K_ESCAPE):
+                if ev.type == pg.QUIT:
                     running = False
+                elif ev.type == pg.KEYDOWN and ev.key == pg.K_ESCAPE:
+                    if self.fullscreen:
+                        self.toggle_fullscreen()
+                    else:
+                        running = False
+                elif ev.type == pg.KEYDOWN and ev.key in (pg.K_F11, pg.K_f):
+                    self.toggle_fullscreen()
                 elif ev.type == pg.KEYDOWN and ev.key == pg.K_SPACE:
                     self.paused = not self.paused
             if not self.paused:
@@ -222,7 +338,14 @@ class App:
             for s, idx in sides.items():
                 hz = delta[idx].mean() / (ms * 1e-3) if len(idx) else 0.0
                 self.rate[g][s] += k * (hz - self.rate[g][s])
+        self.glow.level[self.eyes.vis_idx] = np.maximum(self.glow.level[self.eyes.vis_idx],
+                                                        self.eyes.visual_levels())
         now = time.time()
+        sa = self.eyes.stage_activity()
+        pops = [delta[idx].sum() / len(idx) / (ms * 1e-3) for idx in self.pops.values()]
+        self.flow.append((now, [sa[st] for st in STAGE_COLORS] + pops))
+        while self.flow and now - self.flow[0][0] > TRACE_S:
+            self.flow.popleft()
         gf_spikes = int(delta[np.concatenate(list(self.groups["GF"].values()))].sum())
         self.trace.append((now, self.motion[0][0].mean(), self.motion[1][0].mean(), self.rotation(),
                            self.rate["LC4"]["left"] + self.rate["LC4"]["right"], gf_spikes))
@@ -262,9 +385,10 @@ class App:
         self.draw_mosaics()
         self.draw_motion()
         self.draw_side()
-        self.text("SPACE pause   ·   ESC quit   ·   stay still and the fly's brain goes quiet; move and watch it react",
+        self.text("SPACE pause   ·   F11 full screen   ·   ESC quit   ·   "
+                  "stay still and the fly's brain goes quiet; move and watch it react",
                   (20, CANVAS[1] - 20), FAINT, self.f_small)
-        self.pg.display.flip()
+        self.present()
 
     def draw_camera(self):
         pg = self.pg
@@ -412,62 +536,96 @@ class App:
             right, up = self.motion[e]
             mag = np.clip(np.hypot(right, up) / 4.0, 0, 1)
             ang = np.arctan2(up, right)
-            cols = []
-            for a, m in zip(ang, mag):
-                h = (a / (2 * math.pi)) % 1.0
-                rgb = [0.5 + 0.5 * math.cos(2 * math.pi * (h - o)) for o in (0.0, 1 / 3, 2 / 3)]
-                cols.append(tuple(int(12 + 243 * m * c) for c in rgb))
-            self._hexes((cx, cy), cols, flip_x=(name == "right"))
+            self._hexes((cx, cy), [wheel(a, m) for a, m in zip(ang, mag)], flip_x=(name == "right"))
             self.text(f"{name} eye", (cx, r.bottom - 44), MUTED, self.f_small, "midtop")
         lx = r.x + 14
         for label, a in (("→", 0.0), ("↑", math.pi / 2), ("←", math.pi), ("↓", -math.pi / 2)):
-            h = (a / (2 * math.pi)) % 1.0
-            rgb = tuple(int(12 + 243 * (0.5 + 0.5 * math.cos(2 * math.pi * (h - o)))) for o in (0.0, 1 / 3, 2 / 3))
-            self.pg.draw.circle(self.screen, rgb, (lx + 6, r.bottom - 14), 6)
+            self.pg.draw.circle(self.screen, wheel(a), (lx + 6, r.bottom - 14), 6)
             self.text(label, (lx + 16, r.bottom - 22), MUTED, self.f)
             lx += 50
 
     def draw_side(self):
+        self.draw_brain()
+        self.draw_flow()
+
+    def draw_brain(self):
         pg = self.pg
-        width = CANVAS[0] - SIDE_X - 20
-        r = self.panel((SIDE_X, 72, width, 250), "FLY BRAIN", "live")
-        origin = (r.centerx - self.map.w // 2, r.y + 40)
-        self.screen.blit(self.map.render(self.glow.level, spot=False, gain=0.35), origin)
+        side = "fly's left on the left" if self.map.left_on_screen_left else "fly's left on the right"
+        r = self.panel(BRAIN_RECT, "BRAIN", f"all 138,639 neurons · frontal view, dorsal up, {side}")
+        m = self.map
+        ox, oy = r.centerx - m.w // 2, r.y + 62
+        self.screen.blit(m.render(self.glow.level, spot=False, gain=0.45), (ox, oy))
+        top_row = ("lamina", "lobula plate", "central complex", "mushroom body")
+        rows = {"top": [], "bottom": []}
+        for name, (x, y) in self.regions:
+            rows["top" if name in top_row else "bottom"].append((ox + x, name, (ox + x, oy + y)))
+        for row, ty in (("top", oy - 6), ("bottom", oy + m.h + 6)):
+            placed = sorted(rows[row])
+            xs = []
+            for x, name, p in placed:
+                w = self.f_small.size(name)[0]
+                x = max(x, (xs[-1] if xs else r.x + 12) + w / 2 + 8)
+                xs.append(x + w / 2)
+                q = (x, ty)
+                pg.draw.circle(self.screen, (225, 225, 230), p, 3, 1)
+                pg.draw.line(self.screen, FAINT, p, q, 1)
+                self.text(name, q, (205, 207, 215), self.f_small, "midbottom" if row == "top" else "midtop")
+        bar = 100 / m.um_per_px
+        by = r.bottom - 40
+        pg.draw.line(self.screen, MUTED, (r.right - 14 - bar, by), (r.right - 14, by), 2)
+        self.text("100 µm", (r.right - 20 - bar, by - 7), MUTED, self.f_small, "topright")
 
-        r = self.panel((SIDE_X, 334, width, 380), "WHAT THE BRAIN MAKES OF IT", "Hz, left | right")
-        rows = [("LC4", "looming", LOOM, 150), ("LPLC2", "looming", LOOM, 150),
-                ("HS", "rotation (front→back)", ROT, 250), ("H2", "rotation (back→front)", ROT, 250),
-                ("DNa", "steering", STEER, 120), ("GF", "giant fiber: escape jump", GF, 150)]
-        y = r.y + 40
-        half = (width - 150) // 2
-        for g, role, col, full in rows:
-            self.text(g, (r.x + 12, y), TEXT, self.f_mono)
-            self.text(role, (r.x + 12, y + 17), MUTED, self.f_small)
-            for k, s in enumerate(("left", "right")):
-                v = self.rate[g][s]
-                bar = pg.Rect(r.x + 130 + k * (half + 10), y + 6, half, 10)
-                pg.draw.rect(self.screen, OFF, bar, border_radius=3)
-                frac = min(v / full, 1.0)
-                if frac > 0.005:
-                    if s == "left":
-                        pg.draw.rect(self.screen, col, (bar.right - bar.w * frac, bar.y, bar.w * frac, bar.h), border_radius=3)
-                    else:
-                        pg.draw.rect(self.screen, col, (bar.x, bar.y, bar.w * frac, bar.h), border_radius=3)
-                self.text(f"{v:3.0f}", (bar.x if s == "left" else bar.right, y + 18), FAINT, self.f_small,
-                          "topleft" if s == "left" else "topright")
-            y += 54
+        x = r.x + 12
+        y = r.bottom - 22
+        for name, col in list(STAGE_COLORS.items()) + list(POP_COLORS.items()):
+            short = {"photoreceptors": "photorec.", "motion (T4/T5)": "T4/T5", "visual projection": "VPN",
+                     "central brain": "central", "descending": "descend."}.get(name, name)
+            pg.draw.rect(self.screen, col, (x, y + 4, 8, 8), border_radius=2)
+            t = self.text(short, (x + 11, y), MUTED, self.f_small)
+            x = t.right + 9
 
-        r = self.panel((SIDE_X, 726, width, 210), "HONEST NOTES", "")
-        notes = ["The eyes (flyvis) are trained and match real",
-                 "motion tuning: HS/H2 respond mirror-symmetrically.",
-                 "The central brain uses one strength per synapse:",
-                 "LPLC2 barely responds, the giant fiber also fires",
-                 "for large moving patterns, and DNa steering has a",
-                 "left bias. Movements, not still scenes, drive it."]
-        y = r.y + 36
-        for line in notes:
-            self.text(line, (r.x + 12, y), MUTED, self.f_small)
-            y += 17
+    def draw_flow(self):
+        """Activity of each processing stage over the last seconds: a movement in
+        front of the camera travels down the list."""
+        pg = self.pg
+        r = self.panel(FLOW_RECT, "SIGNAL FLOW", f"eye → brain, last {TRACE_S:.0f} s")
+        names = list(STAGE_COLORS) + list(POP_COLORS)
+        colors = list(STAGE_COLORS.values()) + list(POP_COLORS.values())
+        counts = [self.stage_n[st] for st in STAGE_COLORS] + [len(v) for v in self.pops.values()]
+        units = ["a.u."] * len(STAGE_COLORS) + ["Hz"] * len(POP_COLORS)
+        top, bottom = r.y + 36, r.bottom - 44
+        h = (bottom - top) / len(names)
+        plot_x0, plot_x1 = r.x + 150, r.right - 64
+        now = time.time()
+        flow = list(self.flow)
+        for i, (name, col, n, unit) in enumerate(zip(names, colors, counts, units)):
+            y0 = top + i * h
+            band = pg.Rect(plot_x0, y0 + 4, plot_x1 - plot_x0, h - 8)
+            pg.draw.rect(self.screen, (16, 17, 21), band)
+            pg.draw.rect(self.screen, col, (r.x + 12, y0 + 8, 4, h - 16), border_radius=2)
+            self.text(name, (r.x + 22, y0 + 6), TEXT, self.f_small)
+            src = "flyvis" if i < len(STAGE_COLORS) else "FlyWire"
+            self.text(f"{n:,} n · {src}", (r.x + 22, y0 + 21), FAINT, self.f_small)
+            if len(flow) < 2:
+                continue
+            vals = np.array([f[1][i] for f in flow])
+            top_v = max(vals.max(), 0.02 if unit == "a.u." else 1.0)
+            pts = [(plot_x1 - (now - f[0]) / TRACE_S * band.w, band.bottom - v / top_v * (band.h - 2))
+                   for f, v in zip(flow, vals)]
+            poly = [(pts[0][0], band.bottom)] + pts + [(pts[-1][0], band.bottom)]
+            pg.draw.polygon(self.screen, mix(PANEL, col, 0.35), poly)
+            pg.draw.lines(self.screen, col, False, pts, 2)
+            cur = vals[-1]
+            label = f"{cur:.2f}" if unit == "a.u." else f"{cur:.1f}"
+            self.text(label, (r.right - 12, y0 + 6), TEXT, self.f_mono, "topright")
+            self.text(unit, (r.right - 12, y0 + 22), FAINT, self.f_small, "topright")
+        for sec in range(int(TRACE_S) + 1):
+            x = plot_x1 - sec / TRACE_S * (plot_x1 - plot_x0)
+            self.text(f"-{sec}s" if sec else "now", (x, bottom + 2), FAINT, self.f_small, "midtop")
+        self.text("stages 1-5: flyvis retina & optic lobe (trained, graded), mean |Δ| from adapted level",
+                  (r.x + 12, r.bottom - 26), FAINT, self.f_small)
+        self.text("6-8: FlyWire spiking model, mean firing rate · each trace scaled to its own maximum",
+                  (r.x + 12, r.bottom - 13), FAINT, self.f_small)
 
 
 def main():
